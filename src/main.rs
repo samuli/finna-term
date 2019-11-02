@@ -3,15 +3,18 @@ use std::collections::HashMap;
 #[macro_use]
 extern crate serde;
 extern crate serde_derive;
+extern crate serde_qs;
 extern crate reqwest;
 extern crate colored;
 
-use dialoguer::Input;
 use colored::*;
 use reqwest::Error;
 use serde_json::Value;
 use structopt::StructOpt;
-//use itertools::Itertools;
+
+extern crate rustyline;
+use rustyline::Editor;
+use rustyline::error::ReadlineError;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TranslatedString {
@@ -105,27 +108,29 @@ impl Record {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResults {
-    pub status: String,
     #[serde(default)]
     pub records: Vec<Record>,
     pub result_count: i32,
 }
 
-#[derive(StructOpt)]
-struct Cli {
-    lookfor: String,
-}
-
+#[derive(StructOpt, Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Params {
-    pub lookfor: String,
-    pub limit: i32,
-    pub page: i32,
-    pub lng: String        
+    #[structopt(default_value="")]
+    lookfor: Vec<String>,
+    #[structopt(long, short)]
+    filter: Option<Vec<String>>,
+    #[structopt(long, short, default_value="20")]
+    limit: i32,
+    #[structopt(long, short, default_value="1")]
+    page: i32,
+    #[structopt(long, default_value="fi")]
+    lng: String
 }
 
 fn vec2str(vec: &Vec<String>, delimiter: &str) -> String {
     if vec.len() == 1 {
-        vec[0].clone()
+        return (vec[0].clone().trim()).to_string();
     } else {
         let tot = vec.len();
         vec.iter().enumerate().fold(String::new(), |acc, (i, arg)| {
@@ -133,7 +138,7 @@ fn vec2str(vec: &Vec<String>, delimiter: &str) -> String {
             if i < tot-1 {
                 res = res + delimiter;
             }
-            return res;
+            return (res.trim()).to_string();
         })
     }
 }
@@ -153,8 +158,11 @@ fn render_record(rec: &Record) {
         None => { "".to_string() }
     };
 
-//    let buildings = vec2str(&rec.buildings.iter().map(|b| b.translated.clone()).collect(), " > ");
-    let building = &rec.buildings.first().expect("no building found").translated;
+    //    let buildings = vec2str(&rec.buildings.iter().map(|b| b.translated.clone()).collect(), " > ");
+    let mut building = "";
+    if rec.buildings.len() > 0 {
+        building = &rec.buildings.first().unwrap().translated;
+    }
     
     println!("{title} [{authors} {other_authors}] {format} {building}",
              title = rec.title.bold().green(),
@@ -173,64 +181,70 @@ fn render_results(params: &Params, results: &SearchResults) {
         render_record(&rec);
     }
 }
-fn search(params: &Params) -> Result<(), Error> {
-    let request_url = format!("https://api.finna.fi/api/v1/search?lookfor={lookfor}&type=AllFields&sort=relevance%2Cid%20asc&page={page}&limit={limit}&prettyPrint=false&lng=fi&field[]=id&field[]=title&field[]=formats&field[]=authors&field[]=buildings&field[]=nonPresenterAuthors&lng={lng}",
-                              lookfor = params.lookfor,
-                              page = params.page,
-                              limit = params.limit,
-                              lng = params.lng);
-    println!("{}", request_url);
-    let mut response = reqwest::get(&request_url).expect("Error reading from API");
+fn search(mut params: Params) -> Result<(), Error> {
+    let lookfor = vec2str(&params.lookfor, " ");
+    params.lookfor = vec![];
 
-    let results: SearchResults = response.json().expect("Error parsing results");
-    render_results(&params, &results);
+    let query = serde_qs::to_string(&params);
+    match query {
+        Ok(mut query) => {
+            query = query + "&lookfor=" + &lookfor;
+            let url = "https://api.finna.fi/api/v1/search?".to_owned() + &query;
+            println!("{}", url.dimmed());
+            let mut response = reqwest::get(&url).expect("Error reading from API");
+            if response.status().is_success() {
+                let results: SearchResults = response.json().expect("Error parsing results");
+                render_results(&params, &results);
+            } else {
+                println!("{}", "Search error".bold().red());
+            }
+        }
+        _ => { println!("{}", "Invalid url".bold().red()); }
+    }
     Ok(())
 }
 
-
-#[derive(StructOpt)]
-pub struct Cmd {
-    lookfor: Option<String>,
-    #[structopt(short = "f", long = "filter")]
-    filter: Option<String>
-}
-
 fn main() {
-    let args = Cli::from_args();
+    let mut params = Params::from_args();
+    search(params.clone()).expect("");
 
-    let mut params = Params {
-        lookfor: args.lookfor,
-        limit: 20,
-        page: 1,
-        lng: "fi".to_string()
-    };
-    
-    search(&params).expect("");
 
+    let mut reader = Editor::<()>::new();
+    if let Err(_) = reader.load_history("finna_history.txt") {
+    }
 
     loop {
-        let input: String = Input::new().with_prompt("> ").interact().unwrap();
-        match input.as_ref() {
-            ":q" => { break }
-            ":n" => {
-                params.page = params.page+1;
-                search(&params).expect("");                
-            }
-            &_ => {
-                let cmd = Cmd::from_iter(input.split(" "));
-                //println!("{}", cmd.lookfor.unwrap());
-                match cmd.filter {
-                    Some(filter) => {
-                        println!("{}", filter);
-                    }
-                    _ => {}
-                }
+        let readline = reader.readline("> ");
 
-                params.lookfor = cmd.lookfor.unwrap();
-                params.page = 1;
-                search(&params).expect("");                
+        match readline {
+            Ok(line) => {
+                reader.add_history_entry(&line);
+                match line.as_ref() {
+                    ":q" => { break }
+                    ":n" => {
+                        params.page = params.page+1;
+                        search(params.clone()).expect("");
+                    }
+                    &_ => {
+                        let mut args = vec![""];
+                        let mut input_args = line.split(" ").collect();
+                        args.append(&mut input_args);
+                        params = Params::from_iter(args);
+                        search(params.clone()).expect("");                
+                    }
+                }
+            },
+            Err(ReadlineError::Interrupted) => {
+                reader.save_history("finna_history.txt").unwrap();
+                break
+            }
+            Err(ReadlineError::Eof) => {
+                break
+            },
+            Err(err) => {
+                println!("Error: {:?}", err);
+                break
             }
         }
     }
-    
 }
