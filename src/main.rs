@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::result::Result;
+use std::borrow::Cow::{self, Borrowed, Owned};
+use std::process::Command;
 
 extern crate serde;
 extern crate colored;
@@ -18,14 +19,18 @@ use structopt::StructOpt;
 extern crate open;
 extern crate rustyline;
 use rustyline::error::ReadlineError;
-use rustyline::Editor;
+use rustyline::{CompletionType, Config, Context, EditMode, Editor};
+use rustyline::config::OutputStreamType;
+use rustyline::completion::{Completer, FilenameCompleter, Pair};
+use rustyline::highlight::{Highlighter, MatchingBracketHighlighter};
+use rustyline::hint::{Hinter, HistoryHinter};
+use rustyline_derive::{Helper};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslatedString {
     pub value: String,
     pub translated: String,
 }
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct OnlineUrl {
     #[serde(default)]
@@ -34,6 +39,12 @@ pub struct OnlineUrl {
     pub text: String,
     #[serde(default)]
     pub source: Vec<TranslatedString>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Author {
+    pub name: String,
+    pub role: Option<String>
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,66 +60,17 @@ pub struct Record {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<Vec<String>>,
+    #[serde(default)]
+    pub year: Option<String>,
+
+    pub primary_authors: Vec<String>,
+    pub non_presenter_authors: Vec<Author>,
+
+    #[serde(default)]
+    pub images: Vec<String>,
+    
     #[serde(flatten)]
     extra: HashMap<String, Value>,
-    // #[serde(default)]
-    // pub links: Vec<OnlineUrl>
-}
-
-impl Record {
-    pub fn get_authors(&self) -> Option<Vec<String>> {
-        match self.extra.get("authors") {
-            None => None,
-            Some(authors) => {
-                let res: Result<(Value), serde_json::error::Error> =
-                    serde_json::from_str(&authors.to_string());
-                match res {
-                    Ok(authors) => match authors.get("primary") {
-                        Some(primary) => {
-                            if primary.is_object() {
-                                match primary.as_object() {
-                                    Some(primary) => {
-                                        return Some(
-                                            primary.iter().map(|(name, _)| name.clone()).collect(),
-                                        );
-                                    }
-                                    None => {}
-                                }
-                            }
-                        }
-                        None => {}
-                    },
-                    _ => {}
-                }
-                return None;
-            }
-        }
-    }
-    pub fn get_other_authors(&self) -> Option<Vec<String>> {
-        match self.extra.get("nonPresenterAuthors") {
-            None => None,
-            Some(authors) => {
-                let res: Result<(Value), serde_json::error::Error> =
-                    serde_json::from_str(&authors.to_string());
-                match res {
-                    Ok(authors) => {
-                        if authors.is_object() {
-                            match authors.as_object() {
-                                Some(authors) => {
-                                    return Some(
-                                        authors.iter().map(|(author, _)| author.clone()).collect(),
-                                    );
-                                }
-                                None => {}
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                return None;
-            }
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -144,6 +106,35 @@ pub struct SearchResults {
     #[serde(default)]
     pub result_count: i32,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordFull {
+    #[serde(default)]
+    pub full_record: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordRaw {
+    #[serde(flatten)]
+    raw_data: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResultsFull {
+    #[serde(default)]
+    pub records: Vec<RecordFull>,
+    #[serde(default)]
+    pub result_count: i32,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResultsRaw {
+    #[serde(default)]
+    pub records: Vec<RecordRaw>,
+    #[serde(default)]
+    pub result_count: i32,
+}
 
 #[derive(StructOpt, Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -174,6 +165,59 @@ struct RecordParams {
     field: Vec<String>,
 }
 
+#[derive(Helper)]
+struct MyHelper {
+    completer: FilenameCompleter,
+    highlighter: MatchingBracketHighlighter,
+    hinter: HistoryHinter,
+    colored_prompt: String,
+}
+
+impl Completer for MyHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        ctx: &Context<'_>,
+    ) -> Result<(usize, Vec<Pair>), ReadlineError> {
+        self.completer.complete(line, pos, ctx)
+    }
+}
+
+impl Hinter for MyHelper {
+    fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<String> {
+        self.hinter.hint(line, pos, ctx)
+    }
+}
+
+impl Highlighter for MyHelper {
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        default: bool,
+    ) -> Cow<'b, str> {
+        if default {
+            Borrowed(&self.colored_prompt)
+        } else {
+            Borrowed(prompt)
+        }
+    }
+
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Owned("\x1b[1m".to_owned() + hint + "\x1b[m")
+    }
+
+    fn highlight<'l>(&self, line: &'l str, pos: usize) -> Cow<'l, str> {
+        self.highlighter.highlight(line, pos)
+    }
+
+    fn highlight_char(&self, line: &str, pos: usize) -> bool {
+        self.highlighter.highlight_char(line, pos)
+    }
+}
+
 fn vec2str(vec: &Vec<String>, delimiter: &str) -> String {
     if vec.len() == 1 {
         return (vec[0].clone().trim()).to_string();
@@ -199,53 +243,58 @@ fn view_result(rec: &Record, cnt: usize) {
         None => ("?".to_string(), "?".to_string()),
     };
 
-    let authors = match rec.get_authors() {
-        Some(authors) => { vec2str(&authors, " | ")}
-        None => { "".to_string() }
+    let authors_to_str = |authors:&Vec<Author>| -> Vec<String> {
+        authors.iter().map(|p| p.name.clone()).collect()
     };
-    let other_authors = match rec.get_other_authors() {
-        Some(authors) => { vec2str(&authors, " | ")}
-        None => { "".to_string() }
+    
+    let authors = if rec.primary_authors.len() > 0 {
+        rec.primary_authors.clone()
+    } else if rec.non_presenter_authors.len() > 0 {
+        authors_to_str(&rec.non_presenter_authors).clone()
+    } else {
+        vec![]
     };
-
+               
     let mut building = "";
     if rec.buildings.len() > 0 {
         building = &rec.buildings.first().unwrap().translated;
     }
-
+    let year = match &rec.year {
+        Some(year) => format!(" ({})", year.clone()),
+        None => "".into()
+    };
     println!(
-        "{cnt:>3} {title:.len$} {authors}{other_authors}",
+        "{cnt:>3} {title:.len$}{year}  {format} - {format_code}",
         cnt = (cnt + 1).to_string().yellow(),
-        title = rec.title.as_ref().unwrap(),
-        authors = authors,
-        other_authors = other_authors,
+        title = rec.title.as_ref().unwrap().bold(),
+        year = year,
+        format = format.yellow(),
+        format_code = format_code,
         len = 80
     );
-    println!(
-        "{fill:>3} {format} {format_code} {id:.len$} {building}",
-        fill = "",
-        len = 30,
-        format = format.green().bold(),
-        format_code = format_code.green(),
-        id = rec.id.as_ref().unwrap().cyan(),
-        building = building.blue()
+    println!("{fill:>4}{authors}  {building}",
+             fill = "",
+             building = building.blue(),
+             authors = vec2str(&authors, " | ")
     );
 }
 
 fn view_results(params: &Params, results: &SearchResults) {
-    println!(
-        "{lookfor} ({results} {results_label}, page {page})",
-        //             lookfor_label = format!("{}", "Search".yellow().bold()),
-        lookfor = format!("{}", vec2str(&params.lookfor, " ").yellow().bold()),
-        results_label = format!("{}", "results"),
-        results = results.result_count.to_string(),
-        page = params.page
-    );
-    println!("");
-
     for (i, rec) in results.records.iter().enumerate() {
         view_result(&rec, i);
     }
+    println!(
+        "\n{lookfor} ({results} {results_label}, page {page}){filters}",
+        lookfor = format!("{}", vec2str(&params.lookfor, " ").yellow().bold()),
+        results_label = format!("{}", "results"),
+        results = results.result_count.to_string(),
+        page = params.page,
+        filters = if let Some(filters) = &params.filter {
+            format!(", filter: {:?}", filters)
+        } else {
+            "".to_string()
+        }
+    );
 }
 
 enum RecordQuery {
@@ -274,12 +323,7 @@ fn record_view(id: &str, session: &mut Session) {
     record(
         RecordQuery::Fields,
         &id,
-        vec![
-            "id".to_string(),
-            "title".to_string(),
-            "formats".to_string(),
-            "buildings".to_string(),
-        ],
+        rec_fields(),
         session,
     )
 }
@@ -316,14 +360,14 @@ fn record(query_type: RecordQuery, id: &str, fields: Vec<String>, session: &mut 
             let url = session.app_config.api_url.to_owned() + &"/record?" + &query;
             match call_api(&url, session) {
                 Some(mut response) => {
-                    let results: SearchResults = response.json().expect("Error parsing results");
                     match query_type {
                         RecordQuery::Fields => {
-                            println!("{:?}", results.records[0]);
-                            //view_result(&results.records[0]);
+                            let results: SearchResults = response.json().expect("Error parsing results");
+                            println!("{}", serde_json::to_string_pretty(&results.records[0]).unwrap());
                         }
                         RecordQuery::FullRecord => {
-                            let mut data = serde_json::to_string(&results.records[0].extra["fullRecord"]).unwrap();
+                            let results: SearchResultsFull = response.json().expect("Error parsing results");
+                            let mut data = serde_json::to_string(&results.records[0].full_record).unwrap();
 
                             // Clean up
                             data = data.replace("\\n", "")
@@ -336,10 +380,11 @@ fn record(query_type: RecordQuery, id: &str, fields: Vec<String>, session: &mut 
 
                             println!("{}", data);
                         }
-                        _ => {
+                        RecordQuery::RawData => {
+                            let results: SearchResultsRaw = response.json().expect("Error parsing results");
                             println!(
                                 "{}",
-                                serde_json::to_string_pretty(&results.records[0].extra).unwrap()
+                                serde_json::to_string_pretty(&results.records[0].raw_data).unwrap()
                             );
                         }
                     }
@@ -355,9 +400,21 @@ fn record(query_type: RecordQuery, id: &str, fields: Vec<String>, session: &mut 
     }
 }
 
+fn rec_fields() -> Vec<String> {
+    vec!["id".into(),
+         "title".into(),
+         "formats".into(),
+         "buildings".into(),
+         "images".into(),
+         "primaryAuthors".into(),
+         "nonPresenterAuthors".into(),
+         "year".into()
+    ]
+}
+
 fn search(mut params: Params, session: &mut Session) -> Option<SearchResults> {
     let params_copy = params.clone();
-    params.field = vec!["id".into(), "title".into(), "formats".into(), "buildings".into(), "primaryAuthors".into(), "nonPresenterAuthors".into()];
+    params.field = rec_fields();
     let lookfor = &vec2str(&params.lookfor, " ");
     params.lookfor = vec![];
 
@@ -384,7 +441,18 @@ fn search(mut params: Params, session: &mut Session) -> Option<SearchResults> {
     }
     None
 }
-fn record_action(action: &str, id: &str, session: &mut Session) {
+fn record_action(action: &str, id: &str, record:&Record, session: &mut Session) {
+    let open_record = |holdings: bool| {
+        let anchor = if holdings { "#tabnav"} else { "" };
+        let rec_url = format!("{url}/Record/{id}/Holdings{anchor}",
+                          url = session.app_config.site_url,
+                          id = id,
+                          anchor = anchor);
+        if !open::that(rec_url).is_ok() {
+            error("Error opening external program");
+        }
+    };
+    
     match action {
         "s" => {
             record_view(id, session);
@@ -395,17 +463,30 @@ fn record_action(action: &str, id: &str, session: &mut Session) {
         "full" => {
             record_view_full_record(id, session);
         }
-        "finna" => {
-            let site_url = format!("{url}/Record/{id}", url = session.app_config.site_url, id = id);
-            if !open::that(site_url).is_ok() {
-                error("Error opening external program");
+        "img" => {
+            if let Some(img) = record.images.get(0) {
+                let path = format!("https://finna.fi{}", img);
+                Command::new("feh")
+                    .arg("--auto-zoom")
+                    .arg("--fullscreen")                    
+                    .arg("--borderless")
+                    .arg(path)
+                    .spawn().expect("process failed to execute");
+            } else {
+                println!("No images");
             }
+        }
+        "finna" => {
+            open_record(false);
+        }
+        "status" => {
+            open_record(true);
         }
         _ => {}
     }
 }
 
-fn save_history(reader: &Editor<()>) {
+fn save_history(reader: &Editor<(MyHelper)>) {
     reader.save_history("finna_history.txt").unwrap();
 }
 fn main() {
@@ -421,21 +502,43 @@ fn main() {
     };
 
     let mut params = Params::from_args();
+    println!("p: {:?}", params);
+    
     match search(params.clone(), &mut session) {
         Some(res) => {
             results = res;
         }
         None => {}
     }
+    let config = Config::builder()
+        .history_ignore_space(true)
+        .completion_type(CompletionType::List)
+        .edit_mode(EditMode::Emacs)
+        .output_stream(OutputStreamType::Stdout)
+        .build();
+    
+    let helper = MyHelper {
+        completer: FilenameCompleter::new(),
+        highlighter: MatchingBracketHighlighter::new(),
+        hinter: HistoryHinter {},
+        colored_prompt: "".to_owned(),
+    };
 
-    let mut reader = Editor::<()>::new();
+    let mut reader = Editor::with_config(config);
+    //let mut reader = Editor::<()>::new();
+    reader.set_helper(Some(helper));
+    
     if let Err(_) = reader.load_history("finna_history.txt") {}
 
+    let mut count = 1;
     loop {
-        let readline = reader.readline("> ");
-
+        let p = format!("{}> ", count);
+        reader.helper_mut().expect("No helper").colored_prompt = format!("\x1b[1;32m{}\x1b[0m", p);
+        let readline = reader.readline(&p);
+        
         match readline {
             Ok(line) => {
+                count = count+1;
                 reader.add_history_entry(&line);
 
                 let regex = Regex::new(r"^:([a-z]+)( ([\w\.]+))?$").unwrap();
@@ -453,14 +556,14 @@ fn main() {
                                 Ok(num) => match results.records.get(num - 1) {
                                     Some(rec) => {
                                         let id = rec.id.as_ref().unwrap().to_string();
-                                        record_action(cmd, &id, &mut session);
+                                        record_action(cmd, &id, rec, &mut session);
                                     }
                                     None => {
                                         error("Invalid record number");
                                     }
                                 },
                                 Err(_e) => {
-                                    record_action(cmd, rec_id, &mut session);
+                                    println!("Invalid record index");
                                 }
                             }
                         }
@@ -498,6 +601,23 @@ fn main() {
                                         _ => {}
                                     };
                                 }
+                                "img" => {
+                                    //let imgs = Vec::<String>::new();
+                                    let mut imgs:Vec<String> = results.records.iter().map(|rec| rec.images.iter().map(|img| img.clone()).collect()).collect();
+                                    imgs = imgs.iter().map(|img| format!("https://finna.fi{}", img)).collect();
+                                    if imgs.len() > 0 {
+                                        let mut cmd = Command::new("feh");
+                                        cmd.arg("--auto-zoom")
+                                            .arg("--fullscreen")                    
+                                            .arg("--borderless");
+                                        for img in imgs {
+                                            cmd.arg(img);
+                                        }
+                                        cmd.spawn().expect("process failed to execute");
+                                    } else {
+                                        println!("No images");
+                                    }
+                                }
                                 _ => {
                                     error("Unknown command");
                                 }
@@ -505,20 +625,13 @@ fn main() {
                         }
                     }
                 } else {
-                    // Parse search query
-                    let mut args = vec![""];
-                    let mut input_args = line.split(" ").collect();
-                    args.append(&mut input_args);
-                    match Params::from_iter_safe(args) {
-                        Ok(params) => match search(params.clone(), &mut session) {
-                            Some(res) => {
-                                results = res;
-                            }
-                            None => {}
-                        },
-                        Err(_e) => {
-                            error("Could not parse input");
+                    // Prefix with whitespace to preserve first argument
+                    params = Params::from_iter(format!(" {}", line.trim()).split(" "));
+                    match search(params.clone(), &mut session) {
+                        Some(res) => {
+                            results = res;
                         }
+                        None => {}
                     }
                 }
             }
